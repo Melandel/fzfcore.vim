@@ -54,7 +54,11 @@ if s:is_win
       return a:str
     endif
     if !exists('s:codepage')
-      let s:codepage = libcallnr('kernel32.dll', 'GetACP', 0)
+			if &encoding == 'utf-8'
+				let s:codepage = 65001
+			else
+      	let s:codepage = libcallnr('kernel32.dll', 'GetACP', 0)
+			endif
     endif
     return iconv(a:str, &encoding, 'cp'.s:codepage)
   endfunction
