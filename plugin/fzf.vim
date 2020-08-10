@@ -263,6 +263,7 @@ endfunction
 
 function! s:get_color(attr, ...)
   let gui = !s:is_win && !has('win32unix') && has('termguicolors') && &termguicolors
+		let gui = gui || (has('win64') && has('gui_running'))
   let fam = gui ? 'gui' : 'cterm'
   let pat = gui ? '^#[a-f0-9]\+' : '^[0-9]\+$'
   for group in a:000
