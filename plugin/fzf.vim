@@ -240,9 +240,13 @@ function! s:common_sink(action, lines) abort
   endif
   try
     let empty = empty(s:fzf_expand('%')) && line('$') == 1 && empty(getline(1)) && !&modified
-    let autochdir = &autochdir
-    set noautochdir
+    " Preserve the current working directory in case it's changed during
+    " the execution (e.g. `set autochdir` or `autocmd BufEnter * lcd ...`)
+    let cwd = exists('w:fzf_pushd') ? w:fzf_pushd.dir : expand('%:p:h')
     for item in a:lines
+      if item[0] != '~' && item !~ (s:is_win ? '^[A-Z]:\' : '^/')
+        let item = join([cwd, item], (s:is_win ? '\' : '/'))
+      endif
       if empty
         execute 'e' s:escape(item)
         let empty = 0
@@ -256,14 +260,12 @@ function! s:common_sink(action, lines) abort
     endfor
   catch /^Vim:Interrupt$/
   finally
-    let &autochdir = autochdir
     silent! autocmd! fzf_swap
   endtry
 endfunction
 
 function! s:get_color(attr, ...)
-  let gui = !s:is_win && !has('win32unix') && has('termguicolors') && &termguicolors
-		let gui = gui || (has('win64') && has('gui_running'))
+  let gui = has('gui_running') || (!s:is_win && !has('win32unix') && has('termguicolors') && &termguicolors)
   let fam = gui ? 'gui' : 'cterm'
   let pat = gui ? '^#[a-f0-9]\+' : '^[0-9]\+$'
   for group in a:000
@@ -302,7 +304,7 @@ function! fzf#wrap(...)
   let expects = map(copy(args), 'type(v:val)')
   let tidx = 0
   for arg in copy(a:000)
-    let tidx = index(expects, type(arg), tidx)
+    let tidx = index(expects, type(arg) == 6 ? type(0) : type(arg), tidx)
     if tidx < 0
       throw 'Invalid arguments (expected: [name string] [opts dict] [fullscreen boolean])'
     endif
@@ -353,7 +355,6 @@ function! fzf#wrap(...)
     endfunction
     let opts['sink*'] = remove(opts, 'sink')
   endif
-
   return opts
 endfunction
 
@@ -519,7 +520,7 @@ function! s:dopopd()
   if s:fzf_getcwd() ==# w:fzf_pushd.dir && (!&autochdir || w:fzf_pushd.bufname ==# bufname(''))
     execute w:fzf_pushd.command s:escape(w:fzf_pushd.origin)
   endif
-  unlet w:fzf_pushd
+  unlet! w:fzf_pushd
 endfunction
 
 function! s:xterm_launcher()
@@ -634,6 +635,9 @@ function! s:calc_size(max, val, dict)
   endif
 
   let opts = $FZF_DEFAULT_OPTS.' '.s:evaluate_opts(get(a:dict, 'options', ''))
+  if opts =~ 'preview'
+    return size
+  endif
   let margin = match(opts, '--inline-info\|--info[^-]\{-}inline') > match(opts, '--no-inline-info\|--info[^-]\{-}\(default\|hidden\)') ? 1 : 2
   let margin += stridx(opts, '--border') > stridx(opts, '--no-border') ? 2 : 0
   if stridx(opts, '--header') > stridx(opts, '--no-header')
@@ -653,13 +657,15 @@ function! s:split(dict)
   \ 'left':  ['vertical topleft', 'vertical resize', &columns],
   \ 'right': ['vertical botright', 'vertical resize', &columns] }
   let ppos = s:getpos()
+  let is_popup = 0
   try
     if s:present(a:dict, 'window')
       if type(a:dict.window) == type({})
-        if !has('nvim') && !has('patch-8.2.191')
-          throw 'Vim 8.2.191 or later is required for pop-up window'
+        if !(has('nvim') ? has('nvim-0.4') : has('popupwin') && has('patch-8.2.191'))
+          throw 'Nvim 0.4+ or Vim 8.2.191+ with popupwin feature is required for pop-up window'
         end
         call s:popup(a:dict.window)
+        let is_popup = 1
       else
         execute 'keepalt' a:dict.window
       endif
@@ -677,20 +683,22 @@ function! s:split(dict)
           endif
           execute cmd sz.'new'
           execute resz sz
-          return [ppos, {}]
+          return [ppos, {}, is_popup]
         endif
       endfor
     endif
-    return [ppos, { '&l:wfw': &l:wfw, '&l:wfh': &l:wfh }]
+    return [ppos, is_popup ? {} : { '&l:wfw': &l:wfw, '&l:wfh': &l:wfh }, is_popup]
   finally
-    setlocal winfixwidth winfixheight
+    if !is_popup
+      setlocal winfixwidth winfixheight
+    endif
   endtry
 endfunction
 
 function! s:execute_term(dict, command, temps) abort
   let winrest = winrestcmd()
   let pbuf = bufnr('')
-  let [ppos, winopts] = s:split(a:dict)
+  let [ppos, winopts, is_popup] = s:split(a:dict)
   call s:use_sh()
   let b:fzf = a:dict
   let fzf = { 'buf': bufnr(''), 'pbuf': pbuf, 'ppos': ppos, 'dict': a:dict, 'temps': a:temps,
@@ -754,11 +762,17 @@ function! s:execute_term(dict, command, temps) abort
     if has('nvim')
       call termopen(command, fzf)
     else
-      if !len(&bufhidden)
-        setlocal bufhidden=hide
+      let term_opts = {'exit_cb': function(fzf.on_exit)}
+      if is_popup
+        let term_opts.hidden = 1
+      else
+        let term_opts.curwin = 1
       endif
-      let fzf.buf = term_start([&shell, &shellcmdflag, command], {'curwin': 1, 'exit_cb': function(fzf.on_exit)})
-      if !has('patch-8.0.1261') && !has('nvim') && !s:is_win
+      let fzf.buf = term_start([&shell, &shellcmdflag, command], term_opts)
+      if is_popup && exists('#TerminalWinOpen')
+        doautocmd <nomodeline> TerminalWinOpen
+      endif
+      if !has('patch-8.0.1261') && !s:is_win
         call term_wait(fzf.buf, 20)
       endif
     endif
@@ -829,23 +843,23 @@ if has('nvim')
 else
   function! s:create_popup(hl, opts) abort
     let is_frame = has_key(a:opts, 'border')
-    let buf = is_frame ? '' : term_start(&shell, #{hidden: 1, term_finish: 'close'})
-    let id = popup_create(buf, #{
+    let s:popup_create = {buf -> popup_create(buf, #{
       \ line: a:opts.row,
       \ col: a:opts.col,
       \ minwidth: a:opts.width,
       \ minheight: a:opts.height,
+      \ maxheight: a:opts.height,
       \ zindex: 50 - is_frame,
-    \ })
-
+    \ })}
     if is_frame
+      let id = s:popup_create('')
       call setwinvar(id, '&wincolor', a:hl)
       call setbufline(winbufnr(id), 1, a:opts.border)
       execute 'autocmd BufWipeout * ++once call popup_close('..id..')'
+      return winbufnr(id)
     else
-      execute 'autocmd BufWipeout * ++once call term_sendkeys('..buf..', "exit\<CR>")'
+      autocmd TerminalOpen * ++once call s:popup_create(str2nr(expand('<abuf>')))
     endif
-    return winbufnr(id)
   endfunction
 endif
 
